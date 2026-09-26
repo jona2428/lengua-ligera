@@ -31,7 +31,7 @@ fn tmat(w: &[f32], rows: usize, cols: usize, group: usize) -> TMat {
 
 pub fn export(m: &Model, f: &Fmt) -> IntModel {
     let group = match f {
-        Fmt::Ternary { group } | Fmt::Binary { group } => *group,
+        Fmt::Ternary { group } | Fmt::Binary { group } | Fmt::TritExp { group, .. } => *group,
         _ => panic!("el motor entero sólo acepta formatos ternario/binario"),
     };
     let c = m.cfg;

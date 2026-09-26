@@ -14,6 +14,9 @@ pub enum Fmt {
     Ternary { group: usize },
     /// {-s, +s} por bloque, s = media|w| (estilo XNOR).
     Binary { group: usize },
+    /// Formato propio: trit × 2^e, con exponente de `ebits` bits por bloque (relativo al
+    /// máximo de la matriz). Coma flotante con mantisa de 1.58 bits; la escala es un shift.
+    TritExp { ebits: u32, group: usize },
     /// NF4 de QLoRA: cuantiles de la normal, escala absmax por bloque.
     Nf4 { group: usize },
     /// Codebook aprendido (k-means 1D) por matriz sobre valores normalizados por bloque.
@@ -49,6 +52,9 @@ pub fn catalog() -> Vec<Fmt> {
     }
     v.push(Int { bits: 8, group: 0 });
     v.push(Int { bits: 4, group: 0 });
+    for (e, g) in [(4u32, 16usize), (4, 32), (3, 8), (3, 16), (4, 8)] {
+        v.push(TritExp { ebits: e, group: g });
+    }
     v
 }
 
@@ -73,6 +79,7 @@ impl Fmt {
             Fmt::Int { bits, group } => format!("int{bits}-g{group}"),
             Fmt::Ternary { group } => format!("ternario-g{group}"),
             Fmt::Binary { group } => format!("binario-g{group}"),
+            Fmt::TritExp { ebits, group } => format!("trit-e{ebits}-g{group}"),
             Fmt::Nf4 { group } => format!("nf4-g{group}"),
             Fmt::KMeans { bits, group } => format!("kmeans{bits}-g{group}"),
         }
@@ -88,6 +95,7 @@ impl Fmt {
             Fmt::Int { bits, group } => *bits as f64 + sc(group),
             Fmt::Ternary { group } => 1.6 + sc(group), // 5 trits por byte
             Fmt::Binary { group } => 1.0 + sc(group),
+            Fmt::TritExp { ebits, group } => 1.6 + *ebits as f64 / *group as f64,
             Fmt::Nf4 { group } => 4.0 + sc(group),
             Fmt::KMeans { bits, group } => *bits as f64 + sc(group),
         }
@@ -136,6 +144,18 @@ impl Fmt {
                 let s = b.iter().map(|x| x.abs()).sum::<f32>() / b.len() as f32;
                 b.iter_mut().for_each(|x| *x = if *x >= 0.0 { s } else { -s });
             }),
+            Fmt::TritExp { ebits, group } => {
+                // escala ideal por bloque (regla ternaria), redondeada a potencia de 2 en log,
+                // exponentes recortados a los 2^ebits más altos de la matriz; trits según la escala final
+                let ideal: Vec<f32> = w.chunks(*group).map(ternary_scale).collect();
+                let ex: Vec<i32> = ideal.iter().map(|&s| if s > 0.0 { s.log2().round() as i32 } else { i32::MIN }).collect();
+                let emax = ex.iter().copied().max().unwrap_or(0);
+                let emin = emax - ((1i32 << ebits) - 1);
+                for (b, &e) in w.chunks_mut(*group).zip(&ex) {
+                    let s = if e == i32::MIN { 0.0 } else { 2f32.powi(e.max(emin)) };
+                    b.iter_mut().for_each(|x| *x = if s > 0.0 && x.abs() > 0.5 * s { s * x.signum() } else { 0.0 });
+                }
+            }
             Fmt::Nf4 { group } => {
                 let tab = NF4.to_vec();
                 for_blocks(w, *group, |b| {
@@ -164,6 +184,19 @@ impl Fmt {
             }
         }
     }
+}
+
+/// Escala de la regla ternaria: media de |w| sobre los pesos que superan 0.7·media|w|.
+fn ternary_scale(b: &[f32]) -> f32 {
+    let delta = 0.7 * b.iter().map(|x| x.abs()).sum::<f32>() / b.len() as f32;
+    let (mut sum, mut n) = (0f32, 0usize);
+    for x in b {
+        if x.abs() > delta {
+            sum += x.abs();
+            n += 1;
+        }
+    }
+    if n > 0 { sum / n as f32 } else { 0.0 }
 }
 
 fn absmax(b: &[f32]) -> f32 {
@@ -285,5 +318,24 @@ mod tests {
         for (a, b) in w.iter().zip(&orig) {
             assert!((a - b).abs() < 0.01);
         }
+    }
+}
+
+#[cfg(test)]
+mod trit_exp_tests {
+    use super::*;
+
+    #[test]
+    fn trit_exp_values_are_signed_powers_of_two() {
+        let mut w: Vec<f32> = (0..256).map(|i| ((i * 37 % 101) as f32 - 50.0) / 200.0 * (1.0 + (i / 16) as f32)).collect();
+        Fmt::TritExp { ebits: 3, group: 16 }.apply(&mut w);
+        for b in w.chunks(16) {
+            let nz: Vec<f32> = b.iter().filter(|x| **x != 0.0).map(|x| x.abs()).collect();
+            if let Some(&s) = nz.first() {
+                assert!(nz.iter().all(|&x| x == s), "una sola magnitud por bloque");
+                assert_eq!(s.log2().fract(), 0.0, "magnitud potencia de 2");
+            }
+        }
+        assert!((Fmt::TritExp { ebits: 4, group: 16 }.bits() - 1.85).abs() < 1e-9);
     }
 }

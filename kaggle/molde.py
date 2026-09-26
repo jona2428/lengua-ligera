@@ -65,12 +65,18 @@ def corpus():
                 t = re.sub(r"\n{3,}", "\n\n", t).strip()
                 if len(t) >= 500:
                     docs.append(t)
-            s = "\n\n".join(docs) + "\n\n"
-            ids = table[np.frombuffer(s.encode("utf-32-le"), dtype=np.uint32)]
-            ids = ids[: max(0, target - n)]
-            out.write(ids.tobytes())
-            n += len(ids)
-            print(f"shard {shard}: {len(docs)} docs, total {n/1e6:.0f}M caracteres, unk {np.mean(ids == unk):.5f}", flush=True)
+            del texts
+            nunk = n0 = 0
+            for i in range(0, len(docs), 2000):  # por trozos: poca RAM
+                if n >= target:
+                    break
+                s = "\n\n".join(docs[i:i + 2000]) + "\n\n"
+                ids = table[np.frombuffer(s.encode("utf-32-le"), dtype=np.uint32)][: target - n]
+                out.write(ids.tobytes())
+                n += len(ids)
+                n0 += len(ids)
+                nunk += int((ids == unk).sum())
+            print(f"shard {shard}: {len(docs)} docs, total {n/1e6:.0f}M caracteres, unk {nunk/max(n0,1):.5f}", flush=True)
     print("train.bin listo:", n)
 
 
@@ -266,6 +272,8 @@ def train():
     print(f"config {c} params {npar} batch {batch} steps {steps} lr {lr_max} init '{init}' qat '{qname}' "
           f"train {len(train_d)/1e6:.0f}M dispositivos {len(devs)}x{devs[0].platform}", flush=True)
 
+    if devs[0].platform == "cpu" and not env("ALLOW_CPU", 0):
+        sys.exit("ERROR: JAX sólo ve la CPU. En Kaggle: Session options -> Accelerator -> TPU. (ALLOW_CPU=1 para forzar)")
     mesh = Mesh(np.array(devs), ("data",))
     rep, shard = NamedSharding(mesh, P()), NamedSharding(mesh, P("data"))
     p = jax.device_put({k: jnp.asarray(v) for k, v in p.items()}, rep)

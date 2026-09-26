@@ -84,5 +84,6 @@ pub fn export(m: &Model, f: &Fmt) -> IntModel {
         layers,
         lnf_g: q16(sl(m.lay.lnf_g, d)),
         lnf_b: q16(sl(m.lay.lnf_g + d, d)),
+        act_bits: 0,
     }
 }

@@ -4,7 +4,8 @@ use lengua_ligera::data::{decode, encode, env, env_str, load_vocab};
 use lengua_ligera::intinfer::IntModel;
 
 fn main() {
-    let im = IntModel::load(&env_str("LLI", "runs/tern32.lli"));
+    let mut im = IntModel::load(&env_str("LLI", "runs/tern32.lli"));
+    im.act_bits = env("ACT_BITS", 0);
     let vocab = load_vocab("data/vocab.txt");
     let n: usize = env("N", 400);
     let (tn, td): (i64, i64) = (env("TEMP_NUM", 7), env("TEMP_DEN", 10));

@@ -20,7 +20,9 @@ fn main() {
     let im0 = export(&fm, &f);
     im0.save(&out);
     let bytes = std::fs::metadata(&out).unwrap().len();
-    let im = IntModel::load(&out);
+    let mut im = IntModel::load(&out);
+    im.act_bits = env("ACT_BITS", 0);
+    println!("activaciones: {}", if im.act_bits == 0 { "Q16 (i32)".to_string() } else { format!("int{}", im.act_bits) });
     println!("exportado {out}: {:.1} KB (sólo enteros)", bytes as f64 / 1024.0);
     for mat in fm.lay.matrices(&fm.cfg) {
         f.apply(&mut fm.p[mat.off..mat.off + mat.rows * mat.cols]);

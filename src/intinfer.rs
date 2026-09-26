@@ -36,6 +36,41 @@ fn to_q32(v: i64, sh: i32) -> i64 {
     }
 }
 
+/// v · 2^s con redondeo al más cercano cuando s < 0.
+#[inline]
+pub fn shift_round(v: i64, s: i32) -> i64 {
+    if s >= 0 {
+        v << s
+    } else {
+        let r = -s;
+        (v + (1i64 << (r - 1))) >> r
+    }
+}
+
+/// Cuantiza cada fila (Q16) a enteros de `bits` bits con escala potencia de 2:
+/// x ≈ q · 2^ash. Devuelve (q, ash por fila).
+pub fn quant_rows(x: &[i32], t: usize, k: usize, bits: u32) -> (Vec<i8>, Vec<i32>) {
+    let qmax = (1i64 << (bits - 1)) - 1;
+    let mut q = vec![0i8; t * k];
+    let mut ash = vec![0i32; t];
+    for i in 0..t {
+        let row = &x[i * k..(i + 1) * k];
+        let m = row.iter().map(|v| (*v as i64).abs()).max().unwrap_or(0);
+        let mut s: i32 = if m == 0 { 0 } else { (64 - m.leading_zeros() as i32) - (64 - qmax.leading_zeros() as i32) };
+        while shift_round(m, -s) > qmax {
+            s += 1;
+        }
+        while s > -8 && shift_round(m, -(s - 1)) <= qmax {
+            s -= 1;
+        }
+        ash[i] = s;
+        for j in 0..k {
+            q[i * k + j] = shift_round(row[j] as i64, -s).clamp(-qmax, qmax) as i8;
+        }
+    }
+    (q, ash)
+}
+
 impl TMat {
     /// y[t×cols] (Q32) += x[t×rows] (Q16) · W
     fn mul_acc(&self, y: &mut [i64], x: &[i32], t: usize) {
@@ -81,6 +116,63 @@ impl TMat {
         }
     }
 
+    /// Igual que `mul_acc` pero con entradas int8: x[i,kk] ≈ q · 2^ash[i] (Q16).
+    /// Suma exacta en enteros y un solo shift al final; salida en Q16 (sin sesgo).
+    fn mul8(&self, x8: &[i8], ash: &[i32], t: usize, out: &mut [i32]) {
+        let (k, n, g) = (self.rows, self.cols, self.group);
+        let nb = n / g;
+        let mut a32 = vec![0i32; n];
+        let mut a64 = vec![0i64; n];
+        for i in 0..t {
+            a64.fill(0);
+            for k0 in (0..k).step_by(256) {
+                a32.fill(0);
+                for kk in k0..(k0 + 256).min(k) {
+                    let q = x8[i * k + kk] as i32;
+                    if q == 0 {
+                        continue;
+                    }
+                    let tr = &self.t[kk * n..(kk + 1) * n];
+                    let sr = &self.s[kk * nb..(kk + 1) * nb];
+                    for b in 0..nb {
+                        // |q·s| ≤ 128·32767 → 256 términos caben en i32
+                        let xs = q * sr[b] as i32;
+                        let ab = &mut a32[b * g..(b + 1) * g];
+                        let tb = &tr[b * g..(b + 1) * g];
+                        for c in 0..g {
+                            ab[c] += xs * tb[c] as i32;
+                        }
+                    }
+                }
+                for c in 0..n {
+                    a64[c] += a32[c] as i64;
+                }
+            }
+            for c in 0..n {
+                out[i * n + c] = shift_round(a64[c], ash[i] - self.sh) as i32;
+            }
+        }
+    }
+
+    /// `dot_rows` con x int8 (x ≈ q · 2^ash): trits·q en i32 por bloque, escala, un shift.
+    fn dot_rows8(&self, x8: &[i8], ash: i32, out: &mut [i32]) {
+        let (n, g) = (self.cols, self.group);
+        let nb = n / g;
+        for r in 0..self.rows {
+            let mut acc = 0i64;
+            for b in 0..nb {
+                let tb = &self.t[r * n + b * g..r * n + (b + 1) * g];
+                let xb = &x8[b * g..(b + 1) * g];
+                let mut part = 0i32;
+                for c in 0..g {
+                    part += xb[c] as i32 * tb[c] as i32;
+                }
+                acc += part as i64 * self.s[r * nb + b] as i64;
+            }
+            out[r] = shift_round(acc, ash - self.sh) as i32;
+        }
+    }
+
     /// Valor de W[r,c] en Q16.
     fn value_q16(&self, r: usize, c: usize) -> i32 {
         let v = self.t[r * self.cols + c] as i64 * self.s[r * (self.cols / self.group) + c / self.group] as i64;
@@ -119,6 +211,15 @@ pub struct IntModel {
     pub layers: Vec<ILayer>,
     pub lnf_g: Vec<i32>,
     pub lnf_b: Vec<i32>,
+    /// Bits de las activaciones que entran a cada matmul (0 = Q16 completo). No va en el archivo.
+    pub act_bits: u32,
+}
+
+/// Caché de claves/valores (Q16) para generar de a un carácter.
+pub struct KvCache {
+    pub k: Vec<Vec<i32>>,
+    pub v: Vec<Vec<i32>>,
+    pub len: usize,
 }
 
 pub fn isqrt(n: u64) -> u64 {
@@ -180,53 +281,69 @@ impl IntModel {
         (a + (((b - a) * frac) >> shift)) as i32
     }
 
-    fn attention(&self, qkv: &[i32], t: usize) -> Vec<i32> {
+    /// Atención causal de una consulta q (d) sobre n claves/valores (fila j en k[j·stride..]).
+    fn attn_one(&self, q: &[i32], k: &[i32], v: &[i32], stride: usize, n: usize, out: &mut [i32]) {
         let (d, nh) = (self.d, self.heads);
         let hd = d / nh;
-        let mut ao = vec![0i32; t * d];
-        let mut sc = vec![0i64; t];
-        let mut e = vec![0i64; t];
+        let mut sc = vec![0i64; n];
         let mut acc = vec![0i64; hd];
         for h in 0..nh {
-            for i in 0..t {
-                let q = &qkv[i * 3 * d + h * hd..][..hd];
-                let mut mx = i64::MIN;
-                for j in 0..=i {
-                    let k = &qkv[j * 3 * d + d + h * hd..][..hd];
-                    let mut dot = 0i64;
-                    for c in 0..hd {
-                        dot += q[c] as i64 * k[c] as i64; // Q32
-                    }
-                    let s = ((dot >> Q) * self.att_scale as i64) >> Q; // Q16
-                    sc[j] = s;
-                    mx = mx.max(s);
-                }
-                let mut sum = 0i64;
-                for j in 0..=i {
-                    e[j] = self.exp_neg(mx - sc[j]);
-                    sum += e[j];
-                }
-                acc.fill(0);
-                for j in 0..=i {
-                    let p = (e[j] << Q) / sum; // Q16
-                    if p == 0 {
-                        continue;
-                    }
-                    let v = &qkv[j * 3 * d + 2 * d + h * hd..][..hd];
-                    for c in 0..hd {
-                        acc[c] += p * v[c] as i64; // Q32
-                    }
-                }
+            let qh = &q[h * hd..(h + 1) * hd];
+            let mut mx = i64::MIN;
+            for j in 0..n {
+                let kh = &k[j * stride + h * hd..][..hd];
+                let mut dot = 0i64;
                 for c in 0..hd {
-                    ao[i * d + h * hd + c] = (acc[c] >> Q) as i32;
+                    dot += qh[c] as i64 * kh[c] as i64; // Q32
+                }
+                let s = ((dot >> Q) * self.att_scale as i64) >> Q; // Q16
+                sc[j] = s;
+                mx = mx.max(s);
+            }
+            let mut sum = 0i64;
+            for j in 0..n {
+                sc[j] = self.exp_neg(mx - sc[j]);
+                sum += sc[j];
+            }
+            acc.fill(0);
+            for j in 0..n {
+                let p = (sc[j] << Q) / sum; // Q16
+                if p == 0 {
+                    continue;
+                }
+                let vh = &v[j * stride + h * hd..][..hd];
+                for c in 0..hd {
+                    acc[c] += p * vh[c] as i64; // Q32
                 }
             }
+            for c in 0..hd {
+                out[h * hd + c] = (acc[c] >> Q) as i32;
+            }
+        }
+    }
+
+    fn attention(&self, qkv: &[i32], t: usize) -> Vec<i32> {
+        let d = self.d;
+        let mut ao = vec![0i32; t * d];
+        for i in 0..t {
+            self.attn_one(&qkv[i * 3 * d..i * 3 * d + d], &qkv[d..], &qkv[2 * d..], 3 * d, i + 1, &mut ao[i * d..(i + 1) * d]);
         }
         ao
     }
 
     fn linear(&self, w: &TMat, b: &[i32], x: &[i32], t: usize) -> Vec<i32> {
         let n = w.cols;
+        if self.act_bits > 0 {
+            let (x8, ash) = quant_rows(x, t, w.rows, self.act_bits);
+            let mut out = vec![0i32; t * n];
+            w.mul8(&x8, &ash, t, &mut out);
+            for i in 0..t {
+                for j in 0..n {
+                    out[i * n + j] += b[j];
+                }
+            }
+            return out;
+        }
         let mut acc = vec![0i64; t * n];
         w.mul_acc(&mut acc, x, t);
         let mut out = vec![0i32; t * n];
@@ -236,6 +353,33 @@ impl IntModel {
             }
         }
         out
+    }
+
+    fn logits_row(&self, h: &[i32], out: &mut [i32]) {
+        if self.act_bits > 0 {
+            let (x8, ash) = quant_rows(h, 1, self.d, self.act_bits);
+            self.wte.dot_rows8(&x8, ash[0], out);
+        } else {
+            self.wte.dot_rows(h, out);
+        }
+    }
+
+    /// Resto del bloque tras la atención: proyección, residuo y MLP (t filas).
+    fn block_tail(&self, l: &ILayer, x: &mut [i32], ao: &[i32], t: usize) {
+        let d = self.d;
+        let pr = self.linear(&l.proj, &l.proj_b, ao, t);
+        for (a, b) in x.iter_mut().zip(&pr) {
+            *a += b;
+        }
+        let ln2 = layernorm(x, &l.ln2_g, &l.ln2_b, t, d);
+        let mut h = self.linear(&l.fc, &l.fc_b, &ln2, t);
+        for hv in h.iter_mut() {
+            *hv = self.gelu(*hv);
+        }
+        let o = self.linear(&l.fc2, &l.fc2_b, &h, t);
+        for (a, b) in x.iter_mut().zip(&o) {
+            *a += b;
+        }
     }
 
     /// Logits en Q16 para cada posición (t × vocab).
@@ -252,25 +396,40 @@ impl IntModel {
             let ln1 = layernorm(&x, &l.ln1_g, &l.ln1_b, t, d);
             let qkv = self.linear(&l.qkv, &l.qkv_b, &ln1, t);
             let ao = self.attention(&qkv, t);
-            let pr = self.linear(&l.proj, &l.proj_b, &ao, t);
-            for (a, b) in x.iter_mut().zip(&pr) {
-                *a += b;
-            }
-            let ln2 = layernorm(&x, &l.ln2_g, &l.ln2_b, t, d);
-            let mut h = self.linear(&l.fc, &l.fc_b, &ln2, t);
-            for hv in h.iter_mut() {
-                *hv = self.gelu(*hv);
-            }
-            let o = self.linear(&l.fc2, &l.fc2_b, &h, t);
-            for (a, b) in x.iter_mut().zip(&o) {
-                *a += b;
-            }
+            self.block_tail(l, &mut x, &ao, t);
         }
         let lnf = layernorm(&x, &self.lnf_g, &self.lnf_b, t, d);
         let mut logits = vec![0i32; t * v];
         for i in 0..t {
-            self.wte.dot_rows(&lnf[i * d..(i + 1) * d], &mut logits[i * v..(i + 1) * v]);
+            self.logits_row(&lnf[i * d..(i + 1) * d], &mut logits[i * v..(i + 1) * v]);
         }
+        logits
+    }
+
+    pub fn new_cache(&self) -> KvCache {
+        let n = self.ctx * self.d;
+        KvCache { k: vec![vec![0; n]; self.layers.len()], v: vec![vec![0; n]; self.layers.len()], len: 0 }
+    }
+
+    /// Procesa un carácter en la posición `c.len` usando la caché; devuelve sus logits (Q16).
+    /// Da exactamente lo mismo que la fila correspondiente de `forward`.
+    pub fn step(&self, tok: u8, c: &mut KvCache) -> Vec<i32> {
+        let (d, pos) = (self.d, c.len);
+        assert!(pos < self.ctx, "caché llena");
+        let mut x: Vec<i32> = (0..d).map(|j| self.wte.value_q16(tok as usize, j) + self.wpe[pos * d + j]).collect();
+        let mut ao = vec![0i32; d];
+        for (li, l) in self.layers.iter().enumerate() {
+            let ln1 = layernorm(&x, &l.ln1_g, &l.ln1_b, 1, d);
+            let qkv = self.linear(&l.qkv, &l.qkv_b, &ln1, 1);
+            c.k[li][pos * d..(pos + 1) * d].copy_from_slice(&qkv[d..2 * d]);
+            c.v[li][pos * d..(pos + 1) * d].copy_from_slice(&qkv[2 * d..]);
+            self.attn_one(&qkv[..d], &c.k[li], &c.v[li], d, pos + 1, &mut ao);
+            self.block_tail(l, &mut x, &ao, 1);
+        }
+        c.len += 1;
+        let lnf = layernorm(&x, &self.lnf_g, &self.lnf_b, 1, d);
+        let mut logits = vec![0i32; self.vocab];
+        self.logits_row(&lnf, &mut logits);
         logits
     }
 
@@ -429,7 +588,7 @@ impl IntModel {
             .collect();
         let lnf_g = r.i32s();
         let lnf_b = r.i32s();
-        IntModel { vocab, ctx, d, heads, att_scale, exp2_tab, gelu_tab, wte, wpe, layers, lnf_g, lnf_b }
+        IntModel { vocab, ctx, d, heads, att_scale, exp2_tab, gelu_tab, wte, wpe, layers, lnf_g, lnf_b, act_bits: 0 }
     }
 
     pub fn save(&self, path: &str) {

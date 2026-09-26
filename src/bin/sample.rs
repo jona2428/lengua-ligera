@@ -1,10 +1,18 @@
 //! Genera texto. Uso: MODEL=runs/base.llg N=400 TEMP=0.8 FMT=... sample "prompt"
 use lengua_ligera::data::{decode, encode, env, env_str, load_model, load_vocab};
 use lengua_ligera::model::Acts;
+use lengua_ligera::quant::Fmt;
 use lengua_ligera::rng::Rng;
 
 fn main() {
-    let m = load_model(&env_str("MODEL", "runs/base.llg"));
+    let mut m = load_model(&env_str("MODEL", "runs/base.llg"));
+    let fmt = env_str("FMT", "");
+    if !fmt.is_empty() {
+        let f = Fmt::parse(&fmt).unwrap_or_else(|| panic!("formato desconocido: {fmt}"));
+        for mat in m.lay.matrices(&m.cfg) {
+            f.apply(&mut m.p[mat.off..mat.off + mat.rows * mat.cols]);
+        }
+    }
     let vocab = load_vocab("data/vocab.txt");
     let n: usize = env("N", 400);
     let temp: f32 = env("TEMP", 0.8);

@@ -20,6 +20,45 @@ pub enum Fmt {
     KMeans { bits: u32, group: usize },
 }
 
+/// Catálogo de formatos del banco.
+pub fn catalog() -> Vec<Fmt> {
+    use Fmt::*;
+    let mut v = vec![F32, Float { e: 5, m: 10 }, Float { e: 8, m: 7 }];
+    for g in [32usize, 128] {
+        v.push(Int { bits: 8, group: g });
+        v.push(MiniFloat { e: 4, m: 3, group: g });
+        v.push(MiniFloat { e: 5, m: 2, group: g });
+        v.push(MiniFloat { e: 3, m: 2, group: g });
+        v.push(MiniFloat { e: 2, m: 3, group: g });
+        v.push(Int { bits: 6, group: g });
+        v.push(Int { bits: 5, group: g });
+        v.push(Int { bits: 4, group: g });
+        v.push(MiniFloat { e: 2, m: 1, group: g });
+        v.push(MiniFloat { e: 3, m: 0, group: g });
+        v.push(MiniFloat { e: 1, m: 2, group: g });
+        v.push(Nf4 { group: g });
+        v.push(KMeans { bits: 4, group: g });
+        v.push(Int { bits: 3, group: g });
+        v.push(MiniFloat { e: 1, m: 1, group: g });
+        v.push(MiniFloat { e: 2, m: 0, group: g });
+        v.push(KMeans { bits: 3, group: g });
+        v.push(Int { bits: 2, group: g });
+        v.push(KMeans { bits: 2, group: g });
+        v.push(Ternary { group: g });
+        v.push(Binary { group: g });
+    }
+    v.push(Int { bits: 8, group: 0 });
+    v.push(Int { bits: 4, group: 0 });
+    v
+}
+
+impl Fmt {
+    /// Busca un formato del catálogo por nombre (p. ej. "ternario-g32").
+    pub fn parse(name: &str) -> Option<Fmt> {
+        catalog().into_iter().find(|f| f.name() == name)
+    }
+}
+
 const SCALE_BITS: f64 = 16.0;
 
 impl Fmt {

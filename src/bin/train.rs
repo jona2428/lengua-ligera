@@ -1,6 +1,8 @@
 //! Entrena el modelo FP32. Configuración por variables de entorno:
 //! D L H CTX BATCH STEPS LR WARMUP WD SEED EVAL_EVERY EVAL_CHARS OUT THREADS
-use lengua_ligera::data::{env, env_str, load_bin, save_model};
+use lengua_ligera::data::{env, env_str, load_bin, load_model, save_model};
+use lengua_ligera::eval::evaluate;
+use lengua_ligera::quant::Fmt;
 use lengua_ligera::model::{Acts, Config, Model};
 use lengua_ligera::rng::Rng;
 use std::time::Instant;
@@ -11,33 +13,8 @@ struct Worker {
     loss: f64,
 }
 
-/// Pérdida media (nats/carácter) sobre ventanas disjuntas del set de validación.
-pub fn evaluate(m: &Model, valid: &[u8], chars: usize, threads: usize) -> f64 {
-    let t = m.cfg.ctx;
-    let n_win = (chars.min(valid.len() - 1)) / t;
-    let wt = m.transposed();
-    let sums: Vec<f64> = std::thread::scope(|s| {
-        let hs: Vec<_> = (0..threads)
-            .map(|w| {
-                let wt = &wt;
-                s.spawn(move || {
-                    let mut a = Acts::new(&m.cfg);
-                    let mut sum = 0f64;
-                    for k in (w..n_win).step_by(threads) {
-                        let o = k * t;
-                        sum += m.forward(wt, &mut a, &valid[o..o + t], Some(&valid[o + 1..o + t + 1])) as f64;
-                    }
-                    sum
-                })
-            })
-            .collect();
-        hs.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-    sums.iter().sum::<f64>() / n_win as f64
-}
-
 fn main() {
-    let cfg = Config {
+    let mut cfg = Config {
         vocab: 128,
         ctx: env("CTX", 128),
         d: env("D", 256),
@@ -57,9 +34,22 @@ fn main() {
 
     let train = load_bin("data/train.bin");
     let valid = load_bin("data/valid.bin");
-    let mut m = Model::init(cfg, seed);
+    let init = env_str("INIT", "");
+    let mut m = if init.is_empty() { Model::init(cfg, seed) } else { load_model(&init) };
+    cfg = m.cfg;
+    let qat: Option<Fmt> = std::env::var("QAT").ok().map(|s| Fmt::parse(&s).unwrap_or_else(|| panic!("formato desconocido: {s}")));
+    let mats = m.lay.matrices(&cfg);
+    let mut mq = Model::zeros(cfg);
+    let refresh = |mq: &mut Model, m: &Model| {
+        mq.p.copy_from_slice(&m.p);
+        if let Some(f) = &qat {
+            for mat in &mats {
+                f.apply(&mut mq.p[mat.off..mat.off + mat.rows * mat.cols]);
+            }
+        }
+    };
     let np = m.n_params();
-    println!("config {cfg:?} params {np} batch {batch} steps {steps} lr {lr_max} threads {threads}");
+    println!("config {cfg:?} params {np} batch {batch} steps {steps} lr {lr_max} threads {threads} init '{init}' qat {:?}", qat.as_ref().map(|f| f.name()));
     if let Some(dir) = std::path::Path::new(&out).parent() {
         std::fs::create_dir_all(dir).ok();
     }
@@ -88,11 +78,15 @@ fn main() {
     for step in 1..=steps {
         let offs: Vec<usize> = (0..batch).map(|_| rng.below(train.len() - t - 1)).collect();
         let ta = Instant::now();
-        let wt = m.transposed();
+        if qat.is_some() {
+            refresh(&mut mq, &m);
+        }
+        let fm: &Model = if qat.is_some() { &mq } else { &m };
+        let wt = fm.transposed();
         let tb = Instant::now();
         std::thread::scope(|s| {
             for (wi, w) in workers.iter_mut().enumerate() {
-                let (m, wt, offs, train) = (&m, &wt, &offs, &train);
+                let (m, wt, offs, train) = (fm, &wt, &offs, &train);
                 s.spawn(move || {
                     w.grad.fill(0.0);
                     w.loss = 0.0;
@@ -155,7 +149,8 @@ fn main() {
             );
         }
         if step % eval_every == 0 || step == steps {
-            let vl = evaluate(&m, &valid, eval_chars, threads);
+            refresh(&mut mq, &m);
+            let vl = evaluate(&mq, &valid, eval_chars, threads);
             let bpc = vl / std::f64::consts::LN_2;
             let mark = if vl < best {
                 best = vl;

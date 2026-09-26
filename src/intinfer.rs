@@ -433,6 +433,14 @@ impl IntModel {
         logits
     }
 
+    /// Probabilidades en Q16 (suman ≈ 65536) a partir de logits Q16, sólo enteros.
+    pub fn probs_q16(&self, logits: &[i32]) -> Vec<i32> {
+        let mx = *logits.iter().max().unwrap() as i64;
+        let w: Vec<i64> = logits.iter().map(|&l| self.exp_neg(mx - l as i64)).collect();
+        let total: i64 = w.iter().sum();
+        w.iter().map(|&x| ((x << Q) / total) as i32).collect()
+    }
+
     /// Muestrea con temperatura num/den usando sólo enteros.
     pub fn sample(&self, logits: &[i32], temp_num: i64, temp_den: i64, rng: &mut u64) -> u8 {
         let mx = *logits.iter().max().unwrap() as i64;

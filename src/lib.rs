@@ -2,6 +2,8 @@
 //! formatos numéricos de pesos (calidad vs bits por peso).
 pub mod data;
 pub mod eval;
+pub mod export;
+pub mod intinfer;
 pub mod model;
 pub mod ops;
 pub mod quant;

@@ -56,3 +56,7 @@ A from-scratch Rust stack (no dependencies) that trains a character-level transf
 ## Autor
 
 Neuroteo ([jona2428](https://github.com/jona2428)), con ayuda de Claude.
+
+## Licencia
+
+GPL-3.0-or-later (ver `LICENSE`). Si necesitas usarlo en un producto cerrado, abre un issue para conversar otra licencia.

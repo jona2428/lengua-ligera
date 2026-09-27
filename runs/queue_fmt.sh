@@ -1,6 +1,6 @@
 #!/bin/bash
 # Cola: espera el QAT largo y luego entrena/evalúa los candidatos de formato propio.
-cd /c/Users/Jona/Documents/lengua-ligera
+cd "$(dirname "$0")/.."
 B=target2/release
 while tasklist //FI "IMAGENAME eq train.exe" | grep -q train.exe; do sleep 60; done
 echo "== QAT largo terminado $(date)" >> runs/queue_fmt.log
